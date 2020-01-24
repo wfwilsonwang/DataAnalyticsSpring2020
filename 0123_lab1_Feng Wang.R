@@ -1,3 +1,6 @@
+# Feng Wang
+# Jan.23rd Lab 1
+
 # Creating a dataframe
 # Example: RPI weather dataframe 
 
