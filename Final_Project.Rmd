@@ -1,0 +1,788 @@
+---
+title: "Data Analytics Final Project"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+## Global City Population Estimates
+
+### Introduction
+* Description: of Urban Agglomerations with 300,000 Inhabitants or More 1950-2030 (thousands)
+
+* Publisher: United Nations, Department of Economic and Social Affairs, Population Division (2014). World Urbanization Prospects: The 2014 Revision
+
+* Source URL: https://data.gov.uk/dataset/128a0e7c-e51e-4fba-b743-289e2a8debdf/global-city-population-estimates
+
+* Population of 1692 cities in 1950 – 2010 (temporal: 5 yrs)
+
+* Estimate for 2015 - 2030
+
+### Goals
+* History trend, future estimate for each city, continent 
+
+* Population growth animation (top 20 cities each decade) + prediction of next several decades
+
+* Population clustering in each continent, or one particular country (map)
+
+* Cities/countries with the most/least increasing rate 
+
+* Types of population growth  
+
+```{r message=FALSE, warning=FALSE}
+# libraries 
+library(readxl)
+library(dplyr)
+library(plyr)
+suppressMessages(library(dplyr))
+library(scales)
+library(ggplot2)
+library(rworldmap)
+library(nlme)
+library(minpack.lm)
+library(car)
+library(growthrates)
+library(growthcurver)
+library(tidyverse)
+library(class)
+library(rpart)
+library(rpart.plot)
+library(maps)
+```
+
+### 1. Read data and basic information
+```{r}
+# read
+Pop_data_all = read_excel("/Users/wangfeng/Desktop/ITWS 6600 Data Analytics/Project/global-city-population-estimates.xls", sheet = 2)
+
+# Number of countries
+num_country = nrow(as.data.frame(table(Pop_data_all$`Country or area`)))
+cat('There are', num_country, 'countries in this dataset.\n')
+
+# Number of cities
+num_city = nrow(Pop_data_all)
+cat('There are', num_city, 'cities in this dataset.\n')
+cat('The dataset has history data from 1950 - 2010 and estimates for 2015 - 2030 with a temporal of 5 years.')
+
+```
+
+### 2. Exploratory Data Analysis
+```{r}
+# Plot all the cities
+worldmap = getMap(resolution = "li")
+plot(worldmap)
+points(Pop_data_all$Longitude, Pop_data_all$Latitude, col = "lightblue", pch = 20, cex = 0.6)
+
+k.max = 12
+wss = sapply(1:k.max,function(k){kmeans(Pop_data_all[,6:7], k, nstart = 20, iter.max = 20)$tot.withinss})
+plot(1:k.max,wss, type= "b", xlab = "Number of clusters(k)", ylab = "Within cluster sum of squares")
+icluster = kmeans(Pop_data_all[,6:7], 6, nstart = 7, iter.max = 20)
+
+# plot 
+worldmap = getMap(resolution = "li")
+plot(worldmap)
+points(Pop_data_all$Longitude, Pop_data_all$Latitude, col = "lightblue", pch = 20, cex = 0.6)
+centers = as.data.frame(icluster$centers)
+points(centers$Longitude, centers$Latitude, col = "brown1", pch = 20, cex = 2.5)
+```
+
+
+```{r}
+# Plot all the cities with color indicating population in 2010
+worldmap = getMap(resolution = "li")
+plot(worldmap)
+firstgroup = Pop_data_all[which(Pop_data_all$`2010` > 10000),]
+secondgroup = Pop_data_all[which(Pop_data_all$`2010` > 5000 | Pop_data_all$`2010` < 10000),]
+thirdgroup = Pop_data_all[which(Pop_data_all$`2010` < 5000),]
+points(firstgroup$Longitude, firstgroup$Latitude, col = "brown1", pch = 20, cex = 1.5)
+#points(secondgroup$Longitude, secondgroup$Latitude, col = "royalblue1", pch = 20, cex = 0.4)
+#points(thirdgroup$Longitude, thirdgroup$Latitude, col = "lightgreen", pch = 20, cex = 0.2)
+
+```
+
+```{r include=FALSE}
+# Top 500 cities in each temporal
+worldmap2 = getMap(resolution = "li")
+#for(i in 8:20){
+#  top200_list = Pop_data_all[order(-Pop_data_all[[i]]),][1:200,]
+#  plot(worldmap2)
+#  points(top200_list$Longitude, top200_list$Latitude, col = "lightblue", pch = 20, cex = 0.7)
+#}
+```
+
+
+```{r}
+# Countries 
+country_table = as.data.frame(table(as.factor(Pop_data_all$`Country or area`)))
+country_table = filter(country_table, Freq > 20)
+country_table = country_table[order(country_table$Freq),]
+# barplot(country_table$Freq, 
+#        names.arg = country_table$Var1, main = 'Countries',
+#        col = 'lightblue',
+#        horiz = TRUE, cex.names = 0.5, las = 1,
+#        xlim = c(0,400))
+#axis(1, at = seq(0, 400, 25))
+
+ggplot(data = country_table, aes(x = Var1, y = Freq)) +
+  geom_bar(stat = 'identity', fill="lightblue")+
+  geom_text(aes(label = Freq), vjust=1, color="black", size=3)+
+  ylab("Frequency")+
+  xlab("Country") +
+  ggtitle(paste("Most resided countries"))+
+  scale_x_discrete(limits = country_table$Var1)+
+  theme_minimal() + 
+  coord_flip()
+```
+
+#### 2.1 Twenty most resided cities every five years
+Using prediction model to interpolate the values in between and make it a smooth animation! 
+```{r warning=FALSE}
+# Select the most resided cities and draw barplots
+for (i in c(8,20)){
+  year = colnames(Pop_data_all)[i]
+  temp_data = Pop_data_all
+  temp_data = temp_data[order(-temp_data[[year]]),] # Using [[]] to call columns with a variable
+  temp_20 = temp_data[1:20,]
+  temp_20 = temp_20[order(temp_20[[year]]),] # For barplot in descending order
+  # barplot(temp_20[[i]], 
+  #         main=paste("Population of top 20 resided cities in", year), 
+  #         names.arg = temp_20$`Urban Agglomeration`, 
+  #         horiz = TRUE, cex.names = 0.5, las = 2, col = 'lightblue',
+  #         cex.axis = 0.8,
+  #         xlab = 'Popolation (in thousands)',
+  #         xlim = c(0, 38000)) 
+  # paste to include variable
+  # cex.names to shrink the size 
+  # las = 2 to rotate
+  plot = ggplot(data = temp_20, aes(x = `Urban Agglomeration`, y = temp_20[[i]])) +
+  geom_bar(stat = 'identity', fill="lightblue")+
+  geom_text(aes(label = temp_20[[i]]), vjust=1, color="black", size=3)+
+  ylab("Population (in thousands)")+
+  ylim(c(0,38000)) +
+  ggtitle(paste("Top 20 resided cities in ", year))+
+  scale_x_discrete(limits = temp_20$`Urban Agglomeration`)+
+  theme_minimal() + 
+  coord_flip()
+  
+  print(plot)
+}
+```
+
+#### 2.2 Increasing rate
+Finding the increasing rates with respect to five years ago and finding the 20 most and least cities. Please note that not all rates in every temporal are shown for brevity. 
+```{r}
+rise_rate = vector()
+for (i in 9:20){
+  year_new = colnames(Pop_data_all)[i]
+  year_old = colnames(Pop_data_all)[i-1]
+  
+  rise_table = Pop_data_all[,4]
+  rise_table = mutate(rise_table, increasing = 
+                      (Pop_data_all[[year_new]] - Pop_data_all[[year_old]])/
+                                (Pop_data_all[[year_old]] + 1)) # plus one to prevent infinity  
+  rise_rate[i-8] = mean(unlist(rise_table$increasing))
+  
+  # Increasing rate - highest 20
+  rise_table_high = rise_table[order(-rise_table$increasing),][1:20,]
+  rise_table_high$increasing = rise_table_high$increasing * 100
+#   barplot(rise_table_high$increasing, 
+#          main = paste("Top 20 cities with the highest increasing rate from", year_old, "to",
+#                      year_new), 
+#          names.arg = rise_table_high$`Urban Agglomeration`, 
+#          horiz = TRUE, cex.names = 0.5, las = 2, col = 'lightblue',
+#          cex.axis = 0.8,
+#          xlab = 'Increasing rate (percentage)')
+  
+  # Increasing rate - lowest 20
+  rise_table_low = rise_table[order(rise_table$increasing),][1:20,]
+  rise_table_low$increasing = rise_table_low$increasing * 100
+ # barplot(rise_table_low$increasing, 
+ #         main = paste("Top 20 cities with the lowest increasing rate from", year_old, "to",
+#                      year_new), 
+#          names.arg = rise_table_low$`Urban Agglomeration`, 
+#          horiz = TRUE, cex.names = 0.5, las = 2, col = 'lightblue',
+#          cex.axis = 0.8,
+#          xlab = 'Increasing rate (percentage)')
+}
+```
+
+```{r}
+# World average increasing rate 
+plot(colnames(Pop_data_all)[9:20], rise_rate, type = 'o', col = 'steelblue', lwd = 3,
+     main = 'World average increasing rate ',
+     xla = 'Year', ylab = 'Increasing rate')
+```
+
+#### 2.4 History trend
+To get a first sight of the history data, the trends of the 20 most resided cities in 2010 in the past half a century are investigated. 
+```{r}
+# Top 20 resided
+Pop_data_2010 = Pop_data_all[order(-Pop_data_all$`2010`),][1:200,]
+for (i in 1:3){
+  city = Pop_data_2010$`Urban Agglomeration`[i]
+  temp_data = t(Pop_data_2010[i, 8:20])
+  plot(rownames(temp_data), temp_data, 
+       type = "o", 
+       main = paste("Historical increasing trend from 1950 to 2010 in", city),
+       col = 'steelblue', lwd = 3,
+       xlab = 'Year', ylab = 'Population')
+}
+```
+
+```{r}
+# Three stages in one plot
+# Shanghai, Mexico city, Osaka
+Pop_data_2010 = Pop_data_all[order(-Pop_data_all$`2010`),][,1:20]
+stage_3 = data.frame(Time = colnames(Pop_data_2010)[8:20], Shanghai = t(Pop_data_2010[4,8:20]),
+                     MexicoCity = t(Pop_data_2010[3,8:20]), Osaka = t(Pop_data_2010[6,8:20]))
+colors = c('Shanghai' = "lightblue", 'Mexico City' = "brown1", 'Osaka' = "steelblue")
+ggplot(stage_3, aes(x = Time)) + 
+  geom_line(aes(y = Shanghai, group = 1, color = 'Shanghai'), lwd = 1.5) +
+  geom_point(aes(y = Shanghai, group = 1), color = "white") +
+  geom_line(aes(y = MexicoCity, group = 1, color = 'Mexico City'), lwd = 1.5) +
+  geom_point(aes(y = MexicoCity, group = 1), color = "white") +
+  geom_line(aes(y = Osaka, group = 1, color = 'Osaka'), lwd = 1.5) +
+  geom_point(aes(y = Osaka, group = 1), color = "white") +
+  xlab('Year') +
+  ylab('Population (in thousands)') +
+  ggtitle('Population growth in Shanghai, Mexico City and Osaka') +
+  scale_color_manual(name = 'Cities', values = colors)
+  
+```
+
+```{r}
+# Least 20 resided
+Pop_data_2010 = Pop_data_all[order(Pop_data_all$`2010`),][,1:20]
+for (i in 1:20){
+  city = Pop_data_2010$`Urban Agglomeration`[i]
+  temp_data = t(Pop_data_2010[i, 8:20])
+#  plot(rownames(temp_data), temp_data, 
+#       type = "o", 
+#       main = paste("Population history trend from 1950 to 2010 in", city),
+#       col = 'steelblue', lwd = 3,
+#       xlab = 'Year', ylab = 'Population')
+}
+```
+#### 2.5 World population analysis
+```{r include=FALSE}
+# The histogram of all cities in different years
+for(i in seq(8, 20)){
+  year = colnames(Pop_data_all)[i]
+#  hist(unlist(Pop_data_all[,i]), main = paste('Histogram of all the cities in ', year),
+#       breaks = 100, xlim = c(0, 35000), ylim = c(0, 1300))
+}
+```
+
+```{r}
+# Mean population of all the cities in the past 60 years
+mean_vec = vector()
+min_vec = vector()
+max_vec = vector()
+for(i in seq(1,13)){
+  mean_vec[i] = mean(unlist(Pop_data_all[,7+i]))
+  min_vec[i] = min(Pop_data_all[,7+i])
+  max_vec[i] = max(Pop_data_all[,7+i])
+}
+stat_allcities = data.frame(Year = as.numeric(colnames(Pop_data_all)[8:20]), 
+                            Mean = mean_vec, Min = min_vec, Max = max_vec)
+par(mfrow = c(1,3))
+plot(stat_allcities$Year, stat_allcities$Max, type = 'o', col = 'steelblue', main = 'Max', lwd = 2)
+plot(stat_allcities$Year, stat_allcities$Mean, type = 'o', col = 'steelblue', main = 'Mean', lwd = 2)
+plot(stat_allcities$Year, stat_allcities$Min, type = 'o', col = 'steelblue', main = 'Min', lwd = 2)
+
+
+```
+
+
+
+
+### 3. Population Growth Model
+```{r}
+model_vec = rep(0, nrow(Pop_data_all)) 
+Pop_model = data.frame(Pop_data_all[c(2,4,6:20)])
+Pop_model$Model = model_vec
+# Logistic: 1
+# Exponential: 0
+```
+
+There are three kinds of growth model for reference, linear model, exponential model and logistic model. With the results above, it can be seen that in the beginning of a development of a city, it is usually exponential. And it will be logistic when a city is expanding to a reletively large scale. The linear growth model is not very common hence is not used here. 
+
+The next problem is how to identify which model the population growth follows. 
+#### 3.1 Logistic or Exponential?
+In this section, the model of the city population growth is determined and the predictions are made. Here logistic model is realized by growthcurver model. 
+```{r}
+start_time <- Sys.time()
+
+num_cities = c(1:166, 168:269, 271:368, 370:480, 482:920, 922:945, 947:1051, 1053:1338, 1340:1493, 1495:1692)
+for(i in num_cities) # nrow(Pop_data_all))
+{
+# Start
+city_name = Pop_data_all$`Urban Agglomeration`[i]
+pop_time = as.data.frame(t(Pop_data_all[i,8:20]))
+pop_time$Time = as.numeric(row.names(pop_time))
+names(pop_time)[1] = 'Population'
+pop_time = pop_time[,c(2,1)]
+
+# Exponential model
+exponential.model = lm(log(Population) ~ Time, data = pop_time)
+exp_pred = exp(predict(exponential.model, data.frame(Time = pop_time$Time)))
+exp_SSE = sum((exp_pred - pop_time$Population)**2)
+
+# Logistic model 
+# logistic.model = nls(Population ~ (p0*K)/(p0 + (K - p0)*exp(-r*Time)), data = pop_time)
+# Try to find some initial guesses
+# init = coef(lm(log(Population) ~ Time, data = pop_time))
+# init_list = list(phi1 = pop_time$Population[1], phi2 = as.numeric(init[1]), phi3 = as.numeric(init[2]))
+
+# SSLogis : y = phi1/[1 + exp(-(t-phi2)/phi3)]
+#control = nls.control(minFactor = 1/2048, printEval = TRUE)
+#logistic.model = gnls(Population ~ SSlogis(Time, phi1, phi2, phi3), data = pop_time, control = control) #  control = nls.control(minFactor = 1/22),  start = init_list
+#alpha = coef(logistic.model)
+#logistic_pred = alpha[1]/(1 + exp(-(pop_time$Time - alpha[2])/alpha[3]))
+# logistic_pred = (alpha[1]*alpha[2])/(alpha[1] + (alpha[2] - alpha[1])*exp(-alpha[3]*Time))
+#logistic_SSE = sum((logistic_pred - pop_time$Population)**2)
+
+# Using self made function
+# Carrying capacity model: N =[N0 * exp(r*t)]/[1 + N0 * (exp(r*t) - 1)/K] 
+# K : carrying capacity
+# dN/dt = r*N*(1 - N/K)
+#fit.logistic = function(par, data){
+#  r = par[1]
+#  K = par[2]
+#  N = data[,2]
+#  t = data[,1] - 1950
+#  N0 = data[2,1]
+#  temp = N0 *exp(r*t)/(1 + N0 * (exp(r*t)-1)/K)
+#  sumsq = sum((N -temp)^2)
+#}
+#r_init = (pop_time[13,2] - pop_time[1,2])/(60 * pop_time[1,2]) # 60 yrs
+#K_init = pop_time[13,2]
+#N0_init = pop_time[1,2]
+#par = c(N0_init, r_init, K_init)
+#logistic.model = optim(par, fit.logistic, data = pop_time)
+#r = logistic.model$par[2]
+#K = logistic.model$par[3]
+#N0 = logistic.model$par[1]
+#logistic_pred = (N0 * exp(r*(pop_time$Time- 1950)))/(1 + N0 * (exp(r*(pop_time$Time- 1950)) - 1)/K)
+
+# Growthcurver model
+# K / (1 + ((K - N0) / N0) * exp(-r * t))
+logistic.model = SummarizeGrowth(pop_time$Time-1950, pop_time$Population)
+a = logistic.model$vals
+logistic_pred = a$k / (1 + ((a$k - a$n0) / a$n0) * exp(- a$r * (pop_time$Time-1950))) + pop_time$Population[1]
+logistic_SSE = sum((logistic_pred - pop_time$Population)**2)
+
+# Compare the errors
+a_mod = 'exponential model'
+b_mod = 'logistic model'
+new_time = data.frame(Time = c(2015, 2020, 2025, 2030))
+all_time = c(pop_time$Time, new_time$Time)
+if(exp_SSE > logistic_SSE){
+  # logistic model
+  model_vec[i] = 1
+  Pop_model$Model[i] = 1
+  # print(paste('The population in', i, city_name, 'is best to be modeled by', b_mod))
+  # predict
+  Pop_pred = a$k / (1 + ((a$k - a$n0) / a$n0) * exp(- a$r * (new_time$Time-1950))) + pop_time$Population[1]
+  Pop_model[i,19:22] = Pop_pred
+  all_pop = a$k / (1 + ((a$k - a$n0) / a$n0) * exp(- a$r * (all_time - 1950))) + pop_time$Population[1]
+} else {
+  # expoential model
+  # print(paste('The population in', i, city_name, 'is best to be modeled by', a_mod))
+  Pop_pred = exp(predict(exponential.model, newdata = data.frame(Time = c(2015, 2020, 2025, 2030))))
+  Pop_model[i,19:22] = Pop_pred
+  all_pop = c(exp_pred, Pop_pred)
+}
+
+# plot(pop_time$Time, pop_time$Population, pch = 16, main = paste('Population modeling in', city_name))
+# lines(pop_time$Time, exp_pred, col = 'brown1', lwd = 2) # The results of prediction should be exp()
+# lines(pop_time$Time, logistic_pred, col = "steelblue", lwd = 2)
+
+
+# plot(pop_time$Time, pop_time$Population, pch = 16, main = paste('Population modeling in', city_name), 
+#     xlim = c(1950,2030), ylim = c(min(all_pop), max(Pop_data_all[i,8:24])*1.1), lwd = 2)
+# lines(all_time, all_pop, col = "brown1", lwd = 2)
+# points(new_time$Time, Pop_data_all[i,21:24], col = 'steelblue')
+
+# End 
+}
+
+# 9 of them cannot use exp or logistic model 
+# Spline using loess is used
+for(i in c(167, 270, 369, 481, 921, 946, 1052, 1339, 1494)) # nrow(Pop_data_all))
+{
+# Start
+city_name = Pop_data_all$`Urban Agglomeration`[i]
+pop_time = as.data.frame(t(Pop_data_all[i,8:20]))
+pop_time$Time = as.numeric(row.names(pop_time))
+names(pop_time)[1] = 'Population'
+pop_time = pop_time[,c(2,1)]
+
+# Spline model 
+loess.model = loess(Population ~ Time, pop_time, control=loess.control(surface="direct")) # To extrapolate
+loess_pred = predict(loess.model, data.frame(Time = c(2015, 2020, 2025, 2030)), se = TRUE)
+Pop_model[i,19:22] = loess_pred$fit
+all_time = c(pop_time$Time, new_time$Time)
+all_pop = c(pop_time$Population, loess_pred$fit)
+
+# plot(pop_time$Time, pop_time$Population, pch = 16, main = paste('Population modeling in', city_name), 
+#      xlim = c(1950,2030), ylim = c(min(all_pop), max(Pop_data_all[i,8:24])*1.1), lwd = 2)
+# lines(all_time, all_pop, col = "brown1", lwd = 2)
+# points(new_time$Time, Pop_data_all[i,21:24], col = 'steelblue')
+
+model_vec[i] = 2
+Pop_model$Model[i] = 2
+# End 
+}
+
+names(Pop_model)[19] = 'X2015'
+names(Pop_model)[20] = 'X2020'
+names(Pop_model)[21] = 'X2025'
+names(Pop_model)[22] = 'X2030'
+
+
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+# Models
+table(Pop_model$Model)
+# 0 : exponential
+# 1 : logistic
+# 2 : spline
+```
+
+Most of them follow logistic model but some of them are better to use exponetial model to predict. 
+
+#### 3.2 Growthcurver or SSlogis
+In this section, SSlogis model is used. But many of the cites cannot use this model. The plan is to use two kinds of the logistic model and to choose the more accurate one. But too many cities have difficulties using SSlogis. So this model is abandoned. 
+```{r}
+Pop_model2 = Pop_model
+# Logistic model
+start_time <- Sys.time()
+for(i in seq(1,1)) # nrow(Pop_data_all))
+{
+print(i)
+# Start
+city_name = Pop_data_all$`Urban Agglomeration`[i]
+pop_time = as.data.frame(t(Pop_data_all[i,8:20]))
+pop_time$Time = as.numeric(row.names(pop_time))
+names(pop_time)[1] = 'Population'
+pop_time = pop_time[,c(2,1)]
+# SSLogis : y = phi1/[1 + exp(-(t-phi2)/phi3)]
+
+logistic.model = nls(Population ~ SSlogis(Time, phi1, phi2, phi3), data = pop_time)
+a = as.numeric(coef(logistic.model))
+new_time = data.frame(Time = c(2015, 2020, 2025, 2030))
+Pop_pred = SSlogis(new_time$Time, a[1], a[2], a[3])
+Pop_model2[i,19:22] = Pop_pred
+all_time = c(pop_time$Time, new_time$Time)
+all_pop = SSlogis(all_time, a[1], a[2], a[3])
+
+#plot(pop_time$Time, pop_time$Population, pch = 16, main = paste('Population modeling in', city_name), 
+#     xlim = c(1950,2030), ylim = c(min(all_pop), max(Pop_data_all[i,8:24])*1.1))
+#lines(all_time, all_pop, col = "red")
+#points(new_time$Time, Pop_data_all[i,21:24], col = 'green')
+# End 
+}
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+```{r}
+# Using spline model LOESS
+Pop_model3 = Pop_model
+start_time <- Sys.time()
+for(i in seq(1,1)) # nrow(Pop_data_all))
+{
+# print(i)
+# Start
+city_name = Pop_data_all$`Urban Agglomeration`[i]
+pop_time = as.data.frame(t(Pop_data_all[i,8:20]))
+pop_time$Time = as.numeric(row.names(pop_time))
+names(pop_time)[1] = 'Population'
+pop_time = pop_time[,c(2,1)]
+new_time = data.frame(Time = c(2015, 2020, 2025, 2030))
+
+loess.model = loess(Population ~ Time, pop_time, control=loess.control(surface="direct")) # To extrapolate
+loess_pred = predict(loess.model, data.frame(Time = c(2015, 2020, 2025, 2030)), se = TRUE)
+Pop_model3[i,19:22] = loess_pred$fit
+all_time = c(pop_time$Time, new_time$Time)
+all_pop = c(pop_time$Population, loess_pred$fit)
+
+#plot(pop_time$Time, pop_time$Population, pch = 16, main = paste('Population modeling in', city_name), 
+#     xlim = c(1950,2030), ylim = c(min(all_pop), max(Pop_data_all[i,8:24])*1.1))
+#lines(all_time, all_pop, col = "red")
+#points(new_time$Time, Pop_data_all[i,21:24], col = 'green')
+# End 
+}
+names(Pop_model3)[19] = 'X2015'
+names(Pop_model3)[20] = 'X2020'
+names(Pop_model3)[21] = 'X2025'
+names(Pop_model3)[22] = 'X2030'
+
+end_time <- Sys.time()
+end_time - start_time
+```
+
+#### 3.3 Prediction errors
+In this section, the predictions are compared with the given estimates. The estimates in the dataset are supposed to be predicted combining many factors instead of just data analysis.
+```{r}
+# Using logistic model
+# Error compared with the given estimates
+Error2015 = abs(Pop_model$X2015 - Pop_data_all$`2015`)/Pop_data_all$`2015`
+Error2020 = abs(Pop_model$X2020 - Pop_data_all$`2020`)/Pop_data_all$`2020`
+Error2025 = abs(Pop_model$X2025 - Pop_data_all$`2025`)/Pop_data_all$`2025`
+Error2030 = abs(Pop_model$X2030 - Pop_data_all$`2030`)/Pop_data_all$`2030`
+Pop_model$Error2015 = Error2015
+Pop_model$Error2020 = Error2020
+Pop_model$Error2025 = Error2025
+Pop_model$Error2030 = Error2030
+Pop_model = mutate(Pop_model, mean_Error = (Error2015 + Error2020 + Error2025 + Error2030)/4)
+summary(Pop_model$mean_Error)
+```
+
+```{r}
+# PLots of errors
+# Drop the NAs
+Pop_model_err = drop_na(Pop_model)
+ggplot(Pop_model_err, aes(x = "", y = mean_Error)) + 
+  geom_boxplot() + 
+  ylab('Error rate')
+```
+
+```{r}
+# Using loess model
+# Error compared with the given estimates
+Error2015 = abs(Pop_model3$X2015 - Pop_data_all$`2015`)/Pop_data_all$`2015`
+Error2020 = abs(Pop_model3$X2020 - Pop_data_all$`2020`)/Pop_data_all$`2020`
+Error2025 = abs(Pop_model3$X2025 - Pop_data_all$`2025`)/Pop_data_all$`2025`
+Error2030 = abs(Pop_model3$X2030 - Pop_data_all$`2030`)/Pop_data_all$`2030`
+Pop_model3$Error2015 = Error2015
+Pop_model3$Error2020 = Error2020
+Pop_model3$Error2025 = Error2025
+Pop_model3$Error2030 = Error2030
+Pop_model3 = mutate(Pop_model3, mean_Error = (Error2015 + Error2020 + Error2025 + Error2030)/4)
+
+# PLots of errors
+# Drop the NAs
+Pop_model_err3 = drop_na(Pop_model3)
+hist(Pop_model_err3$mean_Error)
+```
+
+
+
+#### 3.4 Analysis of predictions 
+```{r}
+# Top 200 cities in 1950 and 2030
+worldmap2 = getMap(resolution = "li")
+top200_list_2030 = Pop_model_err[order(-Pop_model_err[[22]]),][1:200,]
+top200_list_1950 = Pop_model_err[order(-Pop_model_err[[5]]),][1:200,]
+plot(worldmap2)
+points(top200_list_1950$Longitude, top200_list_1950$Latitude, col = "steelblue", pch = 20, cex = 1)
+points(top200_list_2030$Longitude, top200_list_2030$Latitude, col = "brown1", pch = 20, cex = 0.5)
+```
+
+```{r}
+# Countries in 1950 
+country_table = as.data.frame(table(as.factor(top200_list_1950$Country.or.area)))
+country_table = filter(country_table, Freq > 2)
+country_table = country_table[order(country_table$Freq),]
+# barplot(country_table$Freq, 
+#        names.arg = country_table$Var1, main = 'Countries',
+#        col = 'lightblue',
+#        horiz = TRUE, cex.names = 0.5, las = 1,
+#        xlim = c(0,400))
+#axis(1, at = seq(0, 400, 25))
+
+ggplot(data = country_table, aes(x = Var1, y = Freq)) +
+  geom_bar(stat = 'identity', fill="lightblue")+
+  geom_text(aes(label = Freq), vjust=1, color="black", size=3)+
+  ylab("Frequency")+
+  xlab("Country") +
+  ggtitle(paste("Most resided countries"))+
+  scale_x_discrete(limits = country_table$Var1)+
+  theme_minimal() + 
+  coord_flip()
+```
+
+```{r}
+# Countries in 2030
+country_table = as.data.frame(table(as.factor(top200_list_2030$Country.or.area)))
+country_table = filter(country_table, Freq > 2)
+country_table = country_table[order(country_table$Freq),]
+# barplot(country_table$Freq, 
+#        names.arg = country_table$Var1, main = 'Countries',
+#        col = 'lightblue',
+#        horiz = TRUE, cex.names = 0.5, las = 1,
+#        xlim = c(0,400))
+#axis(1, at = seq(0, 400, 25))
+
+ggplot(data = country_table, aes(x = Var1, y = Freq)) +
+  geom_bar(stat = 'identity', fill="lightblue")+
+  geom_text(aes(label = Freq), vjust=1, color="black", size=3)+
+  ylab("Frequency")+
+  xlab("Country") +
+  ggtitle(paste("Most resided countries"))+
+  scale_x_discrete(limits = country_table$Var1)+
+  theme_minimal() + 
+  coord_flip()
+```
+
+
+
+```{r}
+# Clustering of top 200 cities
+k.max = 12
+# tot.withinss = Total within-cluster sum of square
+# iter.max = the maximum number of iterations allowed
+# nstart = if centers is a number, how many random sets should be chosen.
+
+# 1950
+wss1 = sapply(1:k.max,function(k){kmeans(top200_list_1950[,3:4], k, nstart = 20, iter.max = 20)$tot.withinss})
+plot(1:k.max,wss1, type= "b", xlab = "Number of clusters(k)", ylab = "Within cluster sum of squares")
+icluster1 = kmeans(top200_list_1950[,3:4], 6, nstart = 7, iter.max = 20)
+
+# 2030
+wss2 = sapply(1:k.max,function(k){kmeans(top200_list_2030[,3:4], k, nstart = 20, iter.max = 20)$tot.withinss})
+plot(1:k.max,wss2, type= "b", xlab = "Number of clusters(k)", ylab = "Within cluster sum of squares")
+icluster2 = kmeans(top200_list_2030[,3:4], 6, nstart = 7, iter.max = 20)
+
+# plot 
+plot(worldmap2)
+centers1 = as.data.frame(icluster1$centers)
+centers2 = as.data.frame(icluster2$centers)
+points(top200_list_1950$Longitude, top200_list_1950$Latitude, col = "lightblue", pch = 20, cex = 1)
+points(top200_list_2030$Longitude, top200_list_2030$Latitude, col = "coral1", pch = 20, cex = 0.6)
+points(centers1$Longitude, centers1$Latitude, col = "steelblue", pch = 20, cex = 3)
+points(centers2$Longitude, centers2$Latitude, col = "brown1", pch = 20, cex = 3)
+```
+
+```{r}
+# Top 20 cities in 1950 
+year = "1950"
+temp_data = Pop_model_err
+temp_data = temp_data[order(-temp_data$X1950),] 
+temp_20 = temp_data[1:20,]
+temp_20 = temp_20[order(temp_20$X1950),] # For barplot in descending order
+barplot(temp_20$X1950, 
+        main=paste("Population of top 20 resided cities in", year), 
+        names.arg = temp_20$Urban.Agglomeration, 
+        horiz = TRUE, cex.names = 0.5, las = 2, col = 'lightblue',
+        cex.axis = 0.8,
+        xlab = 'Popolation (in thousands)',
+        xlim = c(0, max(temp_20$X1950))) 
+```
+
+```{r}
+# Top 20 cities in 2030
+year = "2030"
+temp_data = Pop_model_err
+temp_data = temp_data[order(-temp_data$X2030),] 
+temp_20 = temp_data[1:20,]
+temp_20 = temp_20[order(temp_20$X2030),] # For barplot in descending order
+
+ggplot(data = temp_20, aes(x = Urban.Agglomeration, y = X2030)) +
+  geom_bar(stat = 'identity', fill="lightblue")+
+  geom_text(aes(label = round(X2030)), vjust=1, color="black", size=3)+
+  ylab("Population (in thousands)")+
+  ylim(c(0,60000)) +
+  ggtitle(paste("Top 20 resided cities in ", year))+
+  scale_x_discrete(limits = temp_20$Urban.Agglomeration)+
+  theme_minimal() + 
+  coord_flip()
+```
+
+
+#### 3.5 Developing stages and classification
+If the increasing rate has been decreased for more than three temporals, it will be classified as stage 3, if more than 1, it is in stage 2, otherwise it is stage 1. Then a classification is performed to identify the developing stage without access to all the data. 
+```{r}
+# Increasing rate for each city
+# rate_all2 is the 2nd derivatives of each city
+rate_all = data.frame(Pop_data_all[c(2,4,6:7,9:20)])
+rate_all2 = rate_all
+for(i in c(8:19)){
+  j = i - 3 
+  rate_all[,j] = (Pop_data_all[,i + 1] - Pop_data_all[,i])/(Pop_data_all[,i]+1)
+}
+
+for(i in c(6:15)){
+    rate_all2[,i] = rate_all[,i] - rate_all[,i-1]
+}
+rate_all2$X1955 = NULL
+rate_all2$X2010 = NULL
+stage_vec = rep(0, nrow(Pop_data_all))
+rate_all2$Stage = stage_vec 
+
+for(i in c(1:nrow(Pop_data_all))){
+  if(sum(rate_all2[i,5:14] < 0) > 1 & sum(rate_all2[i,5:14] < 0) < 4){
+    rate_all2$Stage[i] = 2
+  }else if(sum(rate_all2[i,5:14] < 0) > 3){
+   rate_all2$Stage[i] = 3
+  }else{
+    rate_all2$Stage[i] = 1
+  }
+}
+```
+
+```{r}
+table(rate_all2$Stage)
+stage_df = as.data.frame(table(rate_all2$Stage))
+bar = barplot(table(rate_all2$Stage), 
+    main="Pie Chart of Development Stages",
+    col = 'lightblue',
+    xlab = 'Stage', 
+    ylab = 'Frequency')
+text(bar, stage_df$Var1 , paste(stage_df$Freq) ,cex=1, pos = 3) 
+```
+
+```{r}
+# Training and testing set
+# set.seed(0)
+stage_all = data.frame(Pop_data_all[c(2,4,6:8)], rate_all2[15])
+sample_num = sample(1692, 1500)
+stage_train = stage_all[sample_num, ]
+stage_test = stage_all[-sample_num, ]
+```
+
+```{r}
+# Classification using the location and the population at 1950
+# Using KNN
+stage_knn = knn(train = stage_train[3:4], test = stage_test[3:4], cl = stage_train$Stage, k = round(sqrt(1500)))
+table(stage_knn)
+stage_knn_test = stage_test
+
+stage_knn_test$prediction = stage_knn
+stage_knn_test$pred_true = as.numeric(stage_knn_test$prediction == stage_knn_test$Stage)
+paste('The accuracy rate of the prediction of KNN is', sum(stage_knn_test$pred_true)/nrow(stage_knn_test))
+```
+
+```{r}
+table(stage_test$Stage, stage_knn_test$prediction)
+```
+
+```{r}
+# Locations of the cities in different dtages
+worldmap = getMap(resolution = "li")
+plot(worldmap)
+stage1 = stage_all[which(stage_all$Stage == 1),]
+stage2 = stage_all[which(stage_all$Stage == 2),]
+stage3 = stage_all[which(stage_all$Stage == 3),]
+points(stage1$Longitude, stage1$Latitude, col = "brown1", pch = 20, cex = 0.3)
+points(stage2$Longitude, stage2$Latitude, col = "lightgreen", pch = 20, cex = 0.3)
+points(stage3$Longitude, stage3$Latitude, col = "steelblue", pch = 20, cex = 0.3)
+```
+
+
+
+```{r}
+# K-Means
+stage_kmeans_all = stage_all
+icluster_stage = kmeans(stage_all[,3:4], 3, nstart = 7, iter.max = 20)
+stage_kmeans_all$prediction = icluster_stage$cluster
+stage_kmeans_all$pred_true = as.numeric(stage_kmeans_all$prediction == stage_kmeans_all$Stage)
+paste('The accuracy rate of the prediction of KNN is', sum(stage_kmeans_all$pred_true)/nrow(stage_kmeans_all))
+table(stage_kmeans_all$prediction, stage_kmeans_all$Stage)
+```
+
